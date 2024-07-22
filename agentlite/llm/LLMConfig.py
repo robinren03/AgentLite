@@ -15,4 +15,6 @@ class LLMConfig:
         self.api_key: str = os.environ.get("OPENAI_API_KEY", "EMPTY")
         self.base_url = None
         self.provider = None
+        self.is_open = False
+        self.llm_dir = None
         self.__dict__.update(config_dict)

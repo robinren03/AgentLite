@@ -1,6 +1,6 @@
-from langchain.chains import LLMChain
-from langchain.prompts import PromptTemplate
-from openai import OpenAI
+from openai import AsyncOpenAI
+import asyncio
+# from transformers import AutoTokenizer
 
 from agentlite.llm.LLMConfig import LLMConfig
 
@@ -14,111 +14,120 @@ OPENAI_CHAT_MODELS = [
     "gpt-4-32k",
     "gpt-4-32k-0613",
     "gpt-4-1106-preview",
+    "gpt-4o"
 ]
-OPENAI_LLM_MODELS = ["text-davinci-003", "text-ada-001"]
 
+from abc import abstractmethod
+import abc
+import asyncio
 
-class BaseLLM:
-    def __init__(self, llm_config: LLMConfig) -> None:
+class BaseLLM(abc.ABC):
+    def __init__(self, llm_config: LLMConfig):
+        self.is_open = llm_config.is_open
         self.llm_name = llm_config.llm_name
+        self.llm_dir = llm_config.llm_dir
         self.context_len: int = llm_config.context_len
         self.stop: list = llm_config.stop
         self.max_tokens: int = llm_config.max_tokens
         self.temperature: float = llm_config.temperature
         self.end_of_prompt: str = llm_config.end_of_prompt
+    
+    def get_open(self):
+        return self.is_open 
 
-    def __call__(self, prompt: str) -> str:
-        return self.run(prompt)
+    def get_modelname(self, model_name):
+        return self.model_name
+    
+    @classmethod
+    @abstractmethod
+    async def run_with_stream(self, query:str, k=10, stop_judge = None):
+        pass
 
-    def run(self, prompt: str):
-        # return str
-        raise NotImplementedError
+    @classmethod
+    @abstractmethod
+    async def run(self, query:str): #get full output tokens
+        return NotImplementedError
+
+    def append_user_input(self, origin, new):
+        origin.append({"role": "user", "content": new})
+        return origin
+
+    def append_system_input(self, origin, new):
+        origin = [{"role": "system", "content": new}]
+        return origin
+    
+    def append_assistant_input(self, origin, new):
+        origin.append({"role": "assistant", "content": new})
+        return origin
 
 
 class OpenAIChatLLM(BaseLLM):
-    def __init__(self, llm_config: LLMConfig):
-        super().__init__(llm_config=llm_config)
-        self.client = OpenAI(api_key=llm_config.api_key)
+    def __init__(self, llm_config:LLMConfig):
+        super().__init__(llm_config)
+        self.client:AsyncOpenAI = AsyncOpenAI(api_key=llm_config.api_key, base_url=llm_config.base_url)
 
-    def run(self, prompt: str):
-        response = self.client.chat.completions.create(
+    async def run_with_stream(self, query, k=10, stop_judge = None):
+        return NotImplementedError
+
+    async def run(self, query):
+        response = await self.client.chat.completions.create(
             model=self.llm_name,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": prompt},
-            ],
+            messages=query,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens
         )
-        return response.choices[0].message.content
+        return response.choices[0].message['content']
 
-
-class LangchainLLM(BaseLLM):
-    def __init__(self, llm_config: LLMConfig):
-        from langchain_openai import OpenAI
-
+class OpenLLM(BaseLLM):
+    def __init__(self, llm_config:LLMConfig):
         super().__init__(llm_config)
-        llm = OpenAI(
-            model_name=self.llm_name,
+        # self.tokenizer = AutoTokenizer.from_pretrained(llm_config.llm_dir)
+        openai_api_key = "EMPTY"
+        openai_api_base = llm_config.base_url
+        self.client = AsyncOpenAI(
+            api_key=openai_api_key,
+            base_url=openai_api_base,
+        )
+        
+    async def get_first_tokens(self, query, k=10, stop_judge = None): #query can be in the form of tokens
+        response = self.client.chat.completions.create(
+            model=self.llm_name, #gpt-4-turbo , gpt-4
+            messages=query,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
-            base_url=llm_config.base_url,
-            api_key=llm_config.api_key,
-        )
-        human_template = "{prompt}"
-        prompt = PromptTemplate(template=human_template, input_variables=["prompt"])
-        self.llm_chain = LLMChain(prompt=prompt, llm=llm)
+            stream=True
+        ) 
+        response = ""
+        judge_criteria = k
 
-    def run(self, prompt: str):
-        return self.llm_chain.run(prompt)
+        async for chunk in response:
+            response += chunk.choices[0].delta.content
+            if (len(response) > judge_criteria):
+                # response_str = self.tokenizer.decode(response, skip_special_tokens=True)
+                if stop_judge is not None and stop_judge(response):
+                    response.close()
+                    return None, None
+                judge_criteria = 0x7fffffff # No longer should be involved
 
+        # response_str = self.tokenizer.decode(response, skip_special_tokens=True)
+        return response
 
-class LangchainChatModel(BaseLLM):
-    def __init__(self, llm_config: LLMConfig):
-        from langchain_openai import ChatOpenAI
-
-        super().__init__(llm_config)
-        llm = ChatOpenAI(
-            model_name=self.llm_name,
+    async def get_output_tokens(self, query):
+        completion = await self.client.chat.completions.create(
+            model=self.llm_name,
+            messages=query,
             temperature=self.temperature,
-            max_tokens=self.max_tokens,
-            base_url=llm_config.base_url,
-            api_key=llm_config.api_key,
+            max_tokens=self.max_tokens
         )
-        human_template = "{prompt}"
-        prompt = PromptTemplate(template=human_template, input_variables=["prompt"])
-        self.llm_chain = LLMChain(prompt=prompt, llm=llm)
+        response = completion.choices[0].message['content']
+        # response_str = self.tokenizer.decode(response, skip_special_tokens=True)
+        return response
 
-    def run(self, prompt: str):
-        return self.llm_chain.run(prompt)
-
-
-# class LangchainOllamaLLM(BaseLLM):
-#     def __init__(self, llm_config: LLMConfig):
-#         from langchain_community.llms import Ollama
-
-#         super().__init__(llm_config)
-#         llm = Ollama(
-#             model=self.llm_name,
-#             temperature=self.temperature,
-#             num_predict=self.max_tokens,
-#             base_url=llm_config.base_url
-#             # api_key=llm_config.api_key,
-#         )
-#         human_template = "{prompt}"
-#         prompt = PromptTemplate(template=human_template, input_variables=["prompt"])
-#         self.llm_chain = LLMChain(prompt=prompt, llm=llm)
-
-#     def run(self, prompt: str):
-#         return self.llm_chain.run(prompt)
 
 def get_llm_backend(llm_config: LLMConfig):
     llm_name = llm_config.llm_name
     llm_provider = llm_config.provider
     if llm_name in OPENAI_CHAT_MODELS:
-        return LangchainChatModel(llm_config)
-    elif llm_name in OPENAI_LLM_MODELS:
-        return LangchainLLM(llm_config)
+        return OpenAIChatLLM(llm_config)
     else:
-        return LangchainLLM(llm_config)
-    # TODO: add more llm providers and inference APIs but for now we are using langchainLLM as the default
-    # Using other LLM providers will require additional setup and configuration
-    # We suggest subclass BaseLLM and implement the run method for the specific provider in your own best practices
+        return OpenLLM(llm_config)
